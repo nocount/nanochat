@@ -263,6 +263,7 @@ def get_peak_flops(device_name: str) -> float:
         (["mi250"], 362.1e12),
         # Consumer RTX
         (["5090"], 209.5e12),
+        (["5070 ti"], 87.9e12),
         (["4090"], 165.2e12),
         (["3090"], 71e12),
     )

@@ -2,8 +2,15 @@
 Evaluate compression ratio of the tokenizer.
 """
 
+import os
+import argparse
+import pyarrow.parquet as pq
 from nanochat.tokenizer import get_tokenizer, RustBPETokenizer
 from nanochat.dataset import parquets_iter_batched
+
+parser = argparse.ArgumentParser(description='Evaluate tokenizer compression')
+parser.add_argument('--mix-dir', type=str, default=None, help='Directory of held-out parquet files of a mixed-in language (see tok_train --mix-dir); its first row group is added as "mix-val"')
+args = parser.parse_args()
 
 # Random text I got from a random website this morning
 news_text = r"""
@@ -159,6 +166,10 @@ all_text = [
 ]
 if val_text:
     all_text.append(("climbmix-val", val_text))
+if args.mix_dir:
+    mix_path = sorted(os.path.join(args.mix_dir, f) for f in os.listdir(args.mix_dir) if f.endswith('.parquet'))[0]
+    mix_text = "\n".join(pq.ParquetFile(mix_path).read_row_group(0).column('text').to_pylist())
+    all_text.append(("mix-val", mix_text))
 
 # Try out current default compared to GPT-2 and GPT-4 tokenizers
 tokenizer_results = {}

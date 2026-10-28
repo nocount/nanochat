@@ -3,8 +3,10 @@ Evaluate a base checkpoint on Klazan, the second language of the dwarfgpt mixes,
 and write a JSON report.
 
 1. bpb on three held-out sets: Klazan stories, the same stories in English, and
-   ClimbMix val (English web text, the base dataset's own validation shard).
-2. Translation, EN->KZ and KZ->EN, on held-out single sentences, in the line format of
+   ClimbMix val (English web text, the base dataset's own validation shard), computed
+   the way base_train computes val bpb.
+2. Translation, EN->KZ and KZ->EN, on held-out single sentences (one per story, never
+   the opening one), in the line format of
    the bilingual training documents ("English: ...\\nKlazan: ..."). Zero-shot and with
    --shots example pairs before it. Greedy decoding; scored by exact match and chrF
    against the reference, which is the deterministic translator's output.
@@ -17,25 +19,30 @@ import os
 import re
 import json
 import time
+import random
 import argparse
 import tempfile
 import subprocess
 from collections import Counter
 import torch
+import pyarrow as pa
 import pyarrow.parquet as pq
+import nanochat.dataset
 from nanochat.common import compute_init, autodetect_device_type, get_base_dir, print0
 from nanochat.checkpoint_manager import load_model
 from nanochat.tokenizer import get_token_bytes
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
-from nanochat.dataset import index_to_filename, MAX_SHARD, DOWNLOAD_DIR
+from nanochat.dataset import DOWNLOAD_DIR
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 
 parser = argparse.ArgumentParser(description="Klazan evaluation of a base checkpoint")
 parser.add_argument("--model-tag", type=str, required=True)
 parser.add_argument("--step", type=int, default=None, help="checkpoint step (default: last)")
 parser.add_argument("--corpus", type=str, required=True, help="packed Klazan corpus (has kz/val and parallel/val.jsonl)")
 parser.add_argument("--out", type=str, default=None, help="report path (default: <base dir>/logs/<model tag>-klazan_eval.json)")
-parser.add_argument("--bpb-tokens", type=int, default=2*1024*1024, help="tokens per bpb set")
+parser.add_argument("--bpb-tokens", type=int, default=80*524288, help="tokens for ClimbMix val bpb (default: base_train's --eval-tokens)")
+parser.add_argument("--story-bpb-tokens", type=int, default=16*524288, help="tokens for each story set (they hold ~19M, so no repeats)")
 parser.add_argument("--num-sentences", type=int, default=200, help="translation test sentences per direction")
 parser.add_argument("--shots", type=int, default=4, help="example pairs for the few-shot translation run")
 parser.add_argument("--klazan-repo", type=str, default=None, help="klazan checkout, to validate generated text")
@@ -53,29 +60,37 @@ report = {"model_tag": args.model_tag, "step": meta.get("step"), "corpus": os.pa
 t0 = time.time()
 
 # -----------------------------------------------------------------------------
-# 1. bpb: documents are concatenated, each after a BOS, and cut into rows of T+1 tokens
+# 1. bpb, computed exactly as base_train computes val bpb: nanochat's BOS-aligned best-fit
+#    loader over the last parquet file of a data directory. The Klazan and English story
+#    sets get small directories of their own (built once, under the nanochat base dir).
 
-def packed_batches(docs):
-    buf, B = [], args.batch_size
-    for ids in tokenizer.encode(docs, prepend=bos, num_threads=os.cpu_count()):
-        buf.extend(ids)
-        while len(buf) >= B * (T + 1):
-            rows = torch.tensor(buf[:B * (T + 1)], dtype=torch.long).view(B, T + 1)
-            buf = buf[B * (T + 1):]
-            yield rows[:, :-1].to(device), rows[:, 1:].to(device)
+def bpb_of(data_dir, tokens):
+    nanochat.dataset.DATA_DIR = data_dir     # list_parquet_files() reads it at call time
+    loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.batch_size, T, "val", device=device)
+    steps = tokens // (args.batch_size * T)
+    return evaluate_bpb(model, loader, steps, get_token_bytes(device=device))
 
-def bpb_of(docs):
-    steps = args.bpb_tokens // (args.batch_size * T)
-    return evaluate_bpb(model, packed_batches(docs), steps, get_token_bytes(device=device))
+def eval_dir(name, docs):
+    """A data directory whose val split (its last file) holds docs."""
+    d = os.path.join(get_base_dir(), name)
+    path = os.path.join(d, "shard_00001.parquet")
+    if not os.path.exists(path):
+        os.makedirs(d, exist_ok=True)
+        pq.write_table(pa.table({"text": docs}), path + ".tmp", row_group_size=1024, compression="zstd")
+        os.replace(path + ".tmp", path)
+    return d
 
 kz_val_path = sorted(os.path.join(args.corpus, "kz/val", f) for f in os.listdir(os.path.join(args.corpus, "kz/val")))[0]
 kz_docs = pq.read_table(kz_val_path).column("text").to_pylist()
 kz_set = set(kz_docs)
 parallel_val = [json.loads(l) for l in open(os.path.join(args.corpus, "parallel/val.jsonl"))]
 en_docs = [r["en"] for r in parallel_val if r["kz"] in kz_set]  # the same stories, in English
-cm_docs = pq.read_table(os.path.join(DOWNLOAD_DIR, index_to_filename(MAX_SHARD))).column("text").to_pylist()
-report["bpb"] = {name: bpb_of(docs) for name, docs in
-                 (("klazan_val", kz_docs), ("tinystories_en_val", en_docs), ("climbmix_val", cm_docs))}
+report["bpb"] = {
+    "klazan_val": bpb_of(eval_dir("eval_klazan_val", kz_docs), args.story_bpb_tokens),
+    "tinystories_en_val": bpb_of(eval_dir("eval_tinystories_en_val", en_docs), args.story_bpb_tokens),
+    "climbmix_val": bpb_of(DOWNLOAD_DIR, args.bpb_tokens),   # its last file is the ClimbMix val shard
+}
+report["bpb_tokens"] = {"stories": args.story_bpb_tokens, "climbmix": args.bpb_tokens}
 print0(f"bpb: {report['bpb']} | {time.time() - t0:.0f}s")
 
 # -----------------------------------------------------------------------------
@@ -108,9 +123,14 @@ for r in parallel_val:
     if r["kz"] in kz_set:
         continue  # keep the bpb stories and the translation sentences apart
     e, k = split_sentences(r["en"]), split_sentences(r["kz"])
+    if len(e) != len(k) or len(e) < 2:
+        continue
+    # one sentence per story, never the first: openings are formulaic ("Once upon a time"),
+    # so a model that ignores the source still scores well on them
+    i = random.Random(r["id"]).randrange(1, len(e))
     # skip sentences that cross a paragraph break or hold a quote (the split goes wrong inside quotes)
-    if len(e) == len(k) and not re.search(r'[\n"“”]', e[0] + k[0]) and 5 <= len(e[0].split()) <= 20:
-        pairs.append({"en": e[0], "kz": k[0]})
+    if not re.search(r'[\n"“”]', e[i] + k[i]) and 5 <= len(e[i].split()) <= 20:
+        pairs.append({"en": e[i], "kz": k[i]})
     if len(pairs) >= args.shots + args.num_sentences:
         break
 shots, tests = pairs[:args.shots], pairs[args.shots:]

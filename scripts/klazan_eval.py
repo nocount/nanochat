@@ -6,14 +6,17 @@ and write a JSON report.
    ClimbMix val (English web text, the base dataset's own validation shard), computed
    the way base_train computes val bpb.
 2. Translation, EN->KZ and KZ->EN, on held-out single sentences (one per story, never
-   the opening one), in the line format of
-   the bilingual training documents ("English: ...\\nKlazan: ..."). Zero-shot and with
+   the opening one), in the line format of the bilingual training documents
+   ("English: ...\\nKlazan: ..."). Zero-shot and with
    --shots example pairs before it. Greedy decoding; scored by exact match and chrF
-   against the reference, which is the deterministic translator's output.
+   against the reference, which is the deterministic translator's output. KZ->EN is also
+   scored by round trip: does the model's English translate back to the source Klazan?
+   (Klazan merges he/she/it and in/on, so many correct English answers are not exact.)
 3. Free continuations of Klazan story openings. With --klazan-repo, they are checked by
    that repo's validator (klazan.validate), which reports unknown words and loans.
 
-python -m scripts.klazan_eval --model-tag d12-mix10p --corpus path/to/packed --out report.json
+python -m scripts.klazan_eval --model-tag d12-mix10p --corpus path/to/packed --klazan-repo path/to/klazan
+--sections translation reruns just that part and keeps the rest of an existing report.
 """
 import os
 import re
@@ -45,7 +48,8 @@ parser.add_argument("--bpb-tokens", type=int, default=80*524288, help="tokens fo
 parser.add_argument("--story-bpb-tokens", type=int, default=16*524288, help="tokens for each story set (they hold ~19M, so no repeats)")
 parser.add_argument("--num-sentences", type=int, default=200, help="translation test sentences per direction")
 parser.add_argument("--shots", type=int, default=4, help="example pairs for the few-shot translation run")
-parser.add_argument("--klazan-repo", type=str, default=None, help="klazan checkout, to validate generated text")
+parser.add_argument("--klazan-repo", type=str, default=None, help="klazan checkout: validates generated text and round-trips KZ->EN output")
+parser.add_argument("--sections", type=str, default="bpb,translation,continuations", help="which parts to run; the others are kept from an existing report")
 parser.add_argument("--labels", type=str, default="English,Klazan")
 parser.add_argument("--batch-size", type=int, default=8)
 args = parser.parse_args()
@@ -56,7 +60,13 @@ model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args
 engine = Engine(model, tokenizer)
 bos = tokenizer.get_bos_token_id()
 T = meta["model_config"]["sequence_len"]
-report = {"model_tag": args.model_tag, "step": meta.get("step"), "corpus": os.path.abspath(args.corpus)}
+sections = set(args.sections.split(","))
+out_path = args.out or os.path.join(get_base_dir(), "logs", f"{args.model_tag}-klazan_eval.json")
+report = {}
+if sections != {"bpb", "translation", "continuations"} and os.path.exists(out_path):
+    with open(out_path) as f:
+        report = json.load(f)               # update an existing report in place
+report.update({"model_tag": args.model_tag, "step": meta.get("step"), "corpus": os.path.abspath(args.corpus)})
 t0 = time.time()
 
 # -----------------------------------------------------------------------------
@@ -85,13 +95,14 @@ kz_docs = pq.read_table(kz_val_path).column("text").to_pylist()
 kz_set = set(kz_docs)
 parallel_val = [json.loads(l) for l in open(os.path.join(args.corpus, "parallel/val.jsonl"))]
 en_docs = [r["en"] for r in parallel_val if r["kz"] in kz_set]  # the same stories, in English
-report["bpb"] = {
-    "klazan_val": bpb_of(eval_dir("eval_klazan_val", kz_docs), args.story_bpb_tokens),
-    "tinystories_en_val": bpb_of(eval_dir("eval_tinystories_en_val", en_docs), args.story_bpb_tokens),
-    "climbmix_val": bpb_of(DOWNLOAD_DIR, args.bpb_tokens),   # its last file is the ClimbMix val shard
-}
-report["bpb_tokens"] = {"stories": args.story_bpb_tokens, "climbmix": args.bpb_tokens}
-print0(f"bpb: {report['bpb']} | {time.time() - t0:.0f}s")
+if "bpb" in sections:
+    report["bpb"] = {
+        "klazan_val": bpb_of(eval_dir("eval_klazan_val", kz_docs), args.story_bpb_tokens),
+        "tinystories_en_val": bpb_of(eval_dir("eval_tinystories_en_val", en_docs), args.story_bpb_tokens),
+        "climbmix_val": bpb_of(DOWNLOAD_DIR, args.bpb_tokens),   # its last file is the ClimbMix val shard
+    }
+    report["bpb_tokens"] = {"stories": args.story_bpb_tokens, "climbmix": args.bpb_tokens}
+    print0(f"bpb: {report['bpb']} | {time.time() - t0:.0f}s")
 
 # -----------------------------------------------------------------------------
 # 2. translation of held-out sentences
@@ -134,8 +145,33 @@ for r in parallel_val:
     if len(pairs) >= args.shots + args.num_sentences:
         break
 shots, tests = pairs[:args.shots], pairs[args.shots:]
-report["translation"] = {}
-for direction, (src, tgt) in (("en2kz", ("en", "kz")), ("kz2en", ("kz", "en"))):
+
+def klazan_translate(texts):
+    """English -> Klazan with the reference translator, run in the klazan checkout's own env."""
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "en.json"), os.path.join(d, "kz.json")
+        with open(src, "w") as f:
+            json.dump(texts, f)
+        code = ("import json, sys; from klazan.translate import Translator; "
+                "out = [kz for kz, _ in Translator().translate_many(json.load(open(sys.argv[1])))]; "
+                "json.dump(out, open(sys.argv[2], 'w'), ensure_ascii=False)")
+        subprocess.run(["uv", "run", "--quiet", "--group", "nlp", "python", "-c", code, src, dst],
+                       cwd=args.klazan_repo, check=True, capture_output=True)
+        with open(dst) as f:
+            return json.load(f)
+
+# KZ->EN loses information (one pronoun for he/she/it, one word for in/on), so exact match
+# undercounts it. The round trip asks instead whether the model's English translates back
+# to the source Klazan. The reference sentences were translated inside whole stories, which
+# the translator uses (e.g. for names), so even the reference English does not always come
+# back exactly; its rate is reported as the ceiling.
+if "translation" in sections and args.klazan_repo:
+    back = klazan_translate([p["en"] for p in tests])
+    report["kz2en_roundtrip_ceiling"] = sum(b.strip() == p["kz"] for b, p in zip(back, tests)) / len(tests)
+    print0(f"kz2en round-trip ceiling (reference English): {report['kz2en_roundtrip_ceiling']:.3f}")
+if "translation" in sections:
+    report["translation"] = {}
+for direction, (src, tgt) in (("en2kz", ("en", "kz")), ("kz2en", ("kz", "en"))) if "translation" in sections else ():
     label = {"en": EN, "kz": KZ}
     for k in (0, args.shots):
         prefix = "".join(f"{label[src]}: {p[src]}\n{label[tgt]}: {p[tgt]}\n" for p in shots[:k])
@@ -146,20 +182,28 @@ for direction, (src, tgt) in (("en2kz", ("en", "kz")), ("kz2en", ("kz", "en"))):
             hyp = hyp.split("\n")[0].strip()
             rows.append({"src": p[src], "ref": p[tgt], "hyp": hyp, "exact": hyp == p[tgt], "chrf": chrf(hyp, p[tgt])})
         key = f"{direction}_{k}shot"
-        report["translation"][key] = {
+        result = {
             "exact": sum(r["exact"] for r in rows) / len(rows),
             "chrf": sum(r["chrf"] for r in rows) / len(rows),
-            "n": len(rows), "examples": rows[:10],
+            "n": len(rows),
         }
-        print0(f"{key}: exact {report['translation'][key]['exact']:.3f}, chrF {report['translation'][key]['chrf']:.3f} | {time.time() - t0:.0f}s")
+        if direction == "kz2en" and args.klazan_repo:
+            for r, b in zip(rows, klazan_translate([r["hyp"] for r in rows])):
+                r["roundtrip"] = b.strip() == r["src"]
+            result["roundtrip"] = sum(r["roundtrip"] for r in rows) / len(rows)
+        result["examples"] = rows[:10]
+        report["translation"][key] = result
+        print0(f"{key}: " + ", ".join(f"{m} {result[m]:.3f}" for m in ("exact", "chrf", "roundtrip") if m in result)
+               + f" | {time.time() - t0:.0f}s")
 
 # -----------------------------------------------------------------------------
 # 3. free continuations of Klazan story openings
 
 openings = ["Gez drur zengi, zad un", "Un zeng, Lily trukad dra ta", "Ta dwergaz zad grak"]
-continuations = [o + s for o in openings for s in generate(o, max_tokens=128, temperature=0.8, n=4)]
-report["continuations"] = continuations
-if args.klazan_repo:
+if "continuations" in sections:
+    continuations = [o + s for o in openings for s in generate(o, max_tokens=128, temperature=0.8, n=4)]
+    report["continuations"] = continuations
+if "continuations" in sections and args.klazan_repo:
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
         for c in continuations:
             f.write(json.dumps({"id": "gen", "en": "", "kz": c}) + "\n")
@@ -169,7 +213,6 @@ if args.klazan_repo:
     report["continuation_validation"] = (out.stdout + out.stderr).strip().splitlines()[-3:]
     print0("\n".join(report["continuation_validation"]))
 
-out_path = args.out or os.path.join(get_base_dir(), "logs", f"{args.model_tag}-klazan_eval.json")
 with open(out_path, "w") as f:
     json.dump(report, f, indent=1, ensure_ascii=False)
 print0(f"wrote {out_path} | {time.time() - t0:.0f}s")

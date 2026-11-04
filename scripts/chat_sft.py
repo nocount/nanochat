@@ -29,6 +29,7 @@ from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
+from tasks.klazan import Klazan
 
 # -----------------------------------------------------------------------------
 # CLI arguments
@@ -64,6 +65,9 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+parser.add_argument("--klazan-corpus", type=str, default=None, help="packed Klazan corpus dir (has parallel/*.jsonl); adds Klazan translation and story conversations (default: none)")
+parser.add_argument("--klazan-examples", type=int, default=20000, help="Klazan conversations in the training mixture, with --klazan-corpus")
+parser.add_argument("--klazan-val-examples", type=int, default=1000, help="Klazan conversations in the validation mixture, with --klazan-corpus")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -164,13 +168,19 @@ train_tasks = [
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 ]
+if args.klazan_corpus:
+    train_tasks.append(Klazan(args.klazan_corpus, split="train", num_examples=args.klazan_examples)) # dwarfgpt: translation + stories
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
-val_dataset = TaskMixture([
+print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}"
+       + (f", Klazan {args.klazan_examples:,}" if args.klazan_corpus else "") + ")")
+val_tasks = [
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
     GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-]) # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+] # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+if args.klazan_corpus:
+    val_tasks.append(Klazan(args.klazan_corpus, split="val", num_examples=args.klazan_val_examples))
+val_dataset = TaskMixture(val_tasks)
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
 # these two global variables and update them from within the data generator.

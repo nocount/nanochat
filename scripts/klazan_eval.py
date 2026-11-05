@@ -1,5 +1,5 @@
 """
-Evaluate a base checkpoint on Klazan, the second language of the dwarfgpt mixes,
+Evaluate a checkpoint (base or chat) on Klazan, the second language of the dwarfgpt mixes,
 and write a JSON report.
 
 1. bpb on three held-out sets: Klazan stories, the same stories in English, and
@@ -12,8 +12,12 @@ and write a JSON report.
    against the reference, which is the deterministic translator's output. KZ->EN is also
    scored by round trip: does the model's English translate back to the source Klazan?
    (Klazan merges he/she/it and in/on, so many correct English answers are not exact.)
-3. Free continuations of Klazan story openings. With --klazan-repo, they are checked by
-   that repo's validator (klazan.validate), which reports unknown words and loans.
+3. Free continuations of Klazan story openings (with --source sft: stories asked for in
+   chat). With --klazan-repo, they are checked by that repo's validator
+   (klazan.validate), which reports unknown words and loans.
+
+With --source sft or rl, the translation tests are asked as chat turns, worded unlike
+the training templates in tasks/klazan.py, with the few-shot examples as earlier turns.
 
 python -m scripts.klazan_eval --model-tag d12-mix10p --corpus path/to/packed --klazan-repo path/to/klazan
 --sections translation reruns just that part and keeps the rest of an existing report.
@@ -39,8 +43,9 @@ from nanochat.engine import Engine
 from nanochat.dataset import DOWNLOAD_DIR
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 
-parser = argparse.ArgumentParser(description="Klazan evaluation of a base checkpoint")
+parser = argparse.ArgumentParser(description="Klazan evaluation of a checkpoint")
 parser.add_argument("--model-tag", type=str, required=True)
+parser.add_argument("--source", type=str, default="base", choices=["base", "sft", "rl"], help="base: prompts in the pretraining line format; sft/rl: the same tests asked as chat turns")
 parser.add_argument("--step", type=int, default=None, help="checkpoint step (default: last)")
 parser.add_argument("--corpus", type=str, required=True, help="packed Klazan corpus (has kz/val and parallel/val.jsonl)")
 parser.add_argument("--out", type=str, default=None, help="report path (default: <base dir>/logs/<model tag>-klazan_eval.json)")
@@ -51,22 +56,24 @@ parser.add_argument("--shots", type=int, default=4, help="example pairs for the 
 parser.add_argument("--klazan-repo", type=str, default=None, help="klazan checkout: validates generated text and round-trips KZ->EN output")
 parser.add_argument("--sections", type=str, default="bpb,translation,continuations", help="which parts to run; the others are kept from an existing report")
 parser.add_argument("--labels", type=str, default="English,Klazan")
+parser.add_argument("--chat-ask", type=str, default="unseen", choices=["unseen", "seen"], help="chat requests worded unlike the SFT templates (unseen) or as the first SFT template (seen)")
 parser.add_argument("--batch-size", type=int, default=8)
 args = parser.parse_args()
 EN, KZ = args.labels.split(",")
 
 _, _, _, _, device = compute_init(autodetect_device_type())
-model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
+model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+CHAT = args.source != "base"
 engine = Engine(model, tokenizer)
 bos = tokenizer.get_bos_token_id()
 T = meta["model_config"]["sequence_len"]
 sections = set(args.sections.split(","))
-out_path = args.out or os.path.join(get_base_dir(), "logs", f"{args.model_tag}-klazan_eval.json")
+out_path = args.out or os.path.join(get_base_dir(), "logs", f"{args.model_tag}{'' if args.source == 'base' else '-' + args.source}-klazan_eval.json")
 report = {}
 if sections != {"bpb", "translation", "continuations"} and os.path.exists(out_path):
     with open(out_path) as f:
         report = json.load(f)               # update an existing report in place
-report.update({"model_tag": args.model_tag, "step": meta.get("step"), "corpus": os.path.abspath(args.corpus)})
+report.update({"model_tag": args.model_tag, "source": args.source, "step": meta.get("step"), "corpus": os.path.abspath(args.corpus)})
 t0 = time.time()
 
 # -----------------------------------------------------------------------------
@@ -111,6 +118,20 @@ def generate(prompt, max_tokens, temperature=0.0, n=1, seed=42):
     ids = [bos] + tokenizer.encode(prompt)
     outs, _ = engine.generate_batch(ids, num_samples=n, max_tokens=max_tokens, temperature=temperature, seed=seed)
     return [tokenizer.decode(o[len(ids):]) for o in outs]
+
+def generate_chat(messages, max_tokens, temperature=0.0, n=1, seed=42):
+    """The assistant's reply to a conversation; the engine stops at <|assistant_end|>."""
+    ids = tokenizer.render_for_completion({"messages": messages + [{"role": "assistant", "content": ""}]})
+    outs, _ = engine.generate_batch(ids, num_samples=n, max_tokens=max_tokens, temperature=temperature, seed=seed)
+    return [tokenizer.decode(o[len(ids):]).strip() for o in outs]
+
+# Chat-model requests, worded unlike any of tasks/klazan.py's training templates, so the
+# test is whether the model understands the request, not whether it saw this wording.
+CHAT_ASK = {"en2kz": "Could you translate this sentence into Klazan? {text}",
+            "kz2en": "Could you translate this Klazan sentence into English? {text}"}
+if args.chat_ask == "seen":   # the first of tasks/klazan.py's templates, to tell wording from skill
+    CHAT_ASK = {"en2kz": "Translate into Klazan: {text}", "kz2en": "Translate from Klazan into English: {text}"}
+report["chat_ask"] = args.chat_ask if CHAT else None
 
 def chrf(hyp, ref, n_max=6, beta=2.0):
     """chrF (Popović 2015): character n-gram F-score, n = 1..6, recall weighted by beta."""
@@ -175,10 +196,15 @@ for direction, (src, tgt) in (("en2kz", ("en", "kz")), ("kz2en", ("kz", "en"))) 
     label = {"en": EN, "kz": KZ}
     for k in (0, args.shots):
         prefix = "".join(f"{label[src]}: {p[src]}\n{label[tgt]}: {p[tgt]}\n" for p in shots[:k])
+        history = [m for p in shots[:k] for m in ({"role": "user", "content": CHAT_ASK[direction].format(text=p[src])},
+                                                   {"role": "assistant", "content": p[tgt]})]
         rows = []
         for p in tests:
             cap = 3 * len(tokenizer.encode(p[src])) + 8  # from the source only: the engine has no stop string
-            hyp = generate(prefix + f"{label[src]}: {p[src]}\n{label[tgt]}:", max_tokens=cap)[0]
+            if CHAT:
+                hyp = generate_chat(history + [{"role": "user", "content": CHAT_ASK[direction].format(text=p[src])}], max_tokens=cap)[0]
+            else:
+                hyp = generate(prefix + f"{label[src]}: {p[src]}\n{label[tgt]}:", max_tokens=cap)[0]
             hyp = hyp.split("\n")[0].strip()
             rows.append({"src": p[src], "ref": p[tgt], "hyp": hyp, "exact": hyp == p[tgt], "chrf": chrf(hyp, p[tgt])})
         key = f"{direction}_{k}shot"
@@ -200,8 +226,13 @@ for direction, (src, tgt) in (("en2kz", ("en", "kz")), ("kz2en", ("kz", "en"))) 
 # 3. free continuations of Klazan story openings
 
 openings = ["Gez drur zengi, zad un", "Un zeng, Lily trukad dra ta", "Ta dwergaz zad grak"]
+story_asks = ["Please tell me a bedtime story in Klazan.", "Could you write me a short Klazan story about a dragon?",
+              "Tell me a story in Klazan about two friends."]   # unlike the training templates
 if "continuations" in sections:
-    continuations = [o + s for o in openings for s in generate(o, max_tokens=128, temperature=0.8, n=4)]
+    if CHAT:
+        continuations = [s for a in story_asks for s in generate_chat([{"role": "user", "content": a}], max_tokens=256, temperature=0.8, n=4)]
+    else:
+        continuations = [o + s for o in openings for s in generate(o, max_tokens=128, temperature=0.8, n=4)]
     report["continuations"] = continuations
 if "continuations" in sections and args.klazan_repo:
     with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as f:
